@@ -13,14 +13,32 @@ using namespace torch;
 using namespace torch::indexing;
 // namespace fs = std::filesystem;
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> unpack_result(const IValue &result) {
-  std::cout << "is tuple: " << result.isTuple() << std::endl;
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+unpack_result(const IValue &result) {
   auto model_outputs_tuple = result.toTuple();
   std::vector<torch::Tensor> output_tensors;
+  int cnt = 0;
   for (auto &m_op : model_outputs_tuple->elements()) {
     output_tensors.push_back(m_op.toTensor());
+    std::cout << "shape: " << cnt++ << std::endl;
+    std::cout << output_tensors.back().sizes() << std::endl;
+    std::cout << "==========" << std::endl;
   }
   return {output_tensors[0][0], output_tensors[1][0], output_tensors[2][0]};
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+unpack_superglue_result(const IValue &result) {
+  auto model_outputs_tuple = result.toTuple();
+  std::vector<torch::Tensor> output_tensors;
+  int cnt = 0;
+  for (auto &m_op : model_outputs_tuple->elements()) {
+    output_tensors.push_back(m_op.toTensor());
+    std::cout << "shape: " << cnt++ << std::endl;
+    std::cout << output_tensors.back().sizes() << std::endl;
+    std::cout << "==========" << std::endl;
+  }
+  return {output_tensors[0][0], output_tensors[1][0]};
 }
 
 torch::Dict<std::string, Tensor> toTensorDict(const torch::IValue &value) {
@@ -30,7 +48,8 @@ torch::Dict<std::string, Tensor> toTensorDict(const torch::IValue &value) {
 int main(int argc, const char *argv[]) {
   if (argc <= 3) {
     std::cerr << "Usage:" << std::endl;
-    std::cerr << argv[0] << " <image0> <image1> <downscaled_width>" << std::endl;
+    std::cerr << argv[0] << " <image0> <image1> <downscaled_width>"
+              << std::endl;
     return 1;
   }
 
@@ -40,7 +59,7 @@ int main(int argc, const char *argv[]) {
   torch::Device device(torch::kCPU);
   if (torch::cuda::is_available()) {
     std::cout << "CUDA is available! Training on GPU." << std::endl;
-    device = torch::Device(torch::kCUDA);
+    device = torch::Device(torch::kCUDA, 1);
   }
 
   int target_width = std::stoi(argv[3]);
@@ -48,64 +67,79 @@ int main(int argc, const char *argv[]) {
   Tensor image1 = read_image(std::string(argv[2]), target_width).to(device);
 
   // Look for the TorchScript module files in the executable directory
-  // auto executable_dir = fs::weakly_canonical(fs::path(argv[0])).parent_path();
+  // auto executable_dir =
+  // fs::weakly_canonical(fs::path(argv[0])).parent_path();
   auto module_path = "SuperPoint.zip";
   // if (!fs::exists(module_path)) {
-  //   std::cerr << "Could not find the TorchScript module file " << module_path << std::endl;
-  //   return 1;
+  //   std::cerr << "Could not find the TorchScript module file " << module_path
+  //   << std::endl; return 1;
   // }
-  std::cout << "Load SuperPoint"<<std::endl;
+  std::cout << "Load SuperPoint" << std::endl;
   torch::jit::script::Module superpoint = torch::jit::load(module_path);
   superpoint.eval();
   superpoint.to(device);
 
   module_path = "SuperGlue.zip";
   // if (!fs::exists(module_path)) {
-  //   std::cerr << "Could not find the TorchScript module file " << module_path << std::endl;
-  //   return 1;
+  //   std::cerr << "Could not find the TorchScript module file " << module_path
+  //   << std::endl; return 1;
   // }
   torch::jit::script::Module superglue = torch::jit::load(module_path);
   superglue.eval();
   superglue.to(device);
-  std::cout << "Load SuperGlue"<<std::endl;
+  std::cout << "Load SuperGlue" << std::endl;
 
-  int N = 10;
   using namespace std::chrono;
-  auto t0 = high_resolution_clock::now();
   Tensor keypoints0, scores0, descriptors0;
   Tensor keypoints1, scores1, descriptors1;
-  torch::Dict<std::string, Tensor> pred;
-  for (int i = 0; i < N; ++i) {
-    std::cout << i << std::endl;
-    std::tie(keypoints0, scores0, descriptors0) = unpack_result(superpoint.forward({image0}));
-    std::tie(keypoints1, scores1, descriptors1) = unpack_result(superpoint.forward({image1}));
+  Tensor indices0, mscores0;
 
-    torch::Dict<std::string, Tensor> input;
-    input.insert("image0", image0);
-    input.insert("image1", image1);
-    input.insert("keypoints0", keypoints0.unsqueeze(0));
-    input.insert("keypoints1", keypoints1.unsqueeze(0));
-    input.insert("scores0", scores0.unsqueeze(0));
-    input.insert("scores1", scores1.unsqueeze(0));
-    input.insert("descriptors0", descriptors0.unsqueeze(0));
-    input.insert("descriptors1", descriptors1.unsqueeze(0));
-    pred = toTensorDict(superglue.forward({input}));
+  std::tie(keypoints0, scores0, descriptors0) =
+      unpack_result(superpoint.forward({image0}));
+  std::tie(keypoints1, scores1, descriptors1) =
+      unpack_result(superpoint.forward({image1}));
+
+  std::vector<float> img_shape0({image0.size(3), image0.size(2)});
+  std::vector<float> img_shape1({image1.size(3), image1.size(2)});
+  torch::Tensor shape0 = torch::from_blob(
+      img_shape0.data(), {1, 2}, torch::TensorOptions().dtype(torch::kFloat32));
+  torch::Tensor shape1 = torch::from_blob(
+      img_shape1.data(), {1, 2}, torch::TensorOptions().dtype(torch::kFloat32));
+
+  for (int i = 0; i < 3; ++i) {
+    std::tie(indices0, mscores0) = unpack_superglue_result(superglue.forward(
+        {keypoints0.unsqueeze(0), keypoints1.unsqueeze(0),
+         descriptors0.unsqueeze(0), descriptors1.unsqueeze(0),
+         scores0.unsqueeze(0), scores1.unsqueeze(0), shape0, shape1}));
   }
-  double period = duration_cast<duration<double>>(high_resolution_clock::now() - t0).count() / N;
+  std::cout << img_shape0[0] << ", " << img_shape0[1] << std::endl;
+  std::cout << img_shape1[0] << ", " << img_shape1[1] << std::endl;
+  auto t0 = high_resolution_clock::now();
+  int N = 3;
+  for (int i = 0; i < N; ++i) {
+    std::tie(indices0, mscores0) = unpack_superglue_result(superglue.forward(
+        {keypoints0.unsqueeze(0), keypoints1.unsqueeze(0),
+         descriptors0.unsqueeze(0), descriptors1.unsqueeze(0),
+         scores0.unsqueeze(0), scores1.unsqueeze(0), shape0, shape1}));
+  }
+  double period =
+      duration_cast<duration<double>>(high_resolution_clock::now() - t0)
+          .count() /
+      N;
   std::cout << period * 1e3 << " ms, FPS: " << 1 / period << std::endl;
 
-  auto matches = pred.at("matches0")[0];
+  auto matches = indices0;
   auto valid = at::nonzero(matches > -1).squeeze();
   auto mkpts0 = keypoints0.index_select(0, valid);
   auto mkpts1 = keypoints1.index_select(0, matches.index_select(0, valid));
-  auto confidence = pred.at("matching_scores0")[0].index_select(0, valid);
+  auto confidence = mscores0.index_select(0, valid);
 
   std::cout << "Image #0 keypoints: " << keypoints0.size(0) << std::endl;
   std::cout << "Image #1 keypoints: " << keypoints1.size(0) << std::endl;
   std::cout << "Valid match count: " << valid.size(0) << std::endl;
 
-  cv::Mat plot =
-      make_matching_plot_fast(image0, image1, keypoints0, keypoints1, mkpts0, mkpts1, confidence);
+  cv::Mat plot = make_matching_plot_fast(image0, image1, keypoints0, keypoints1,
+                                         mkpts0, mkpts1, confidence);
   cv::imwrite("matches.png", plot);
   std::cout << "Done! Created matches.png for visualization." << std::endl;
 }
